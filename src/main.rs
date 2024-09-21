@@ -4,6 +4,7 @@ use fantoccini::actions::{PointerAction, MOUSE_BUTTON_RIGHT, MOUSE_BUTTON_LEFT, 
 
 use std::collections::HashSet;
 use std::time::Instant;
+use std::io::Read;
 
 const NROWS: usize = 16;
 const NCOLS: usize = 30;
@@ -13,12 +14,15 @@ const BOMBFLAGGED: i8 = -2;
 
 type Board = [[i8; NCOLS]; NROWS];
 
-use tokio::io::AsyncReadExt;
-const STEP: bool = true;
+fn main() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap(); 
+    rt.block_on(async_main());
+}
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-
+async fn async_main() {
     let client = fantoccini::ClientBuilder::native()
         .connect("http://localhost:4444")
         .await
@@ -42,15 +46,12 @@ async fn main() {
         }
         if let Ok(facedead) = client.find(Locator::Css(".facedead")).await {
             println!("Defeat!");
-            if STEP {
-                break true;
-            } else {
-                facedead
-                    .click()
-                    .await
-                    .expect("clickable facedead to reset game");
-                click_center_cell(&client).await;
-            }
+            facedead
+                .click()
+                .await
+                .expect("clickable facedead to reset game");
+            click_center_cell(&client).await;
+            updated_cells = None;
         }
 
         let start = Instant::now();
@@ -73,13 +74,6 @@ async fn main() {
             false
         };
 
-        if STEP {
-            let _ = tokio::io::stdin().read(&mut b).await.unwrap();
-            if b[0] == b'q' {
-                break false;
-            }
-        }
-
         let start = Instant::now();
         // check for non-empty result
         if let Some(cells) = Some(clear(&client, &board).await).filter(|c| !c.is_empty()) {
@@ -97,13 +91,6 @@ async fn main() {
             }
         }
 
-        if STEP {
-            let _ = tokio::io::stdin().read(&mut b).await.unwrap();
-            if b[0] == b'q' {
-                break false;
-            }
-        }
-
         if !flag_succ && updated_cells.is_none() {
             if flag_succ {
                 if let Some(cells) = check_all_bombs_flagged_then_clear(&client, &mut board).await {
@@ -112,34 +99,23 @@ async fn main() {
                 }
             }
             println!("reached a fix point");
-            if STEP {
-                let _ = tokio::io::stdin().read(&mut b).await.unwrap();
-                if b[0] == b'q' {
-                    break false;
-                } else {
-                    continue;
-                }
-            } else if let Some(pos) = clear_random_blank(&client, &mut board).await {
+            if let Some(pos) = clear_random_blank(&client, &mut board).await {
                 updated_cells = Some(HashSet::from([pos]));
             }
         }
     };
 
     if automated_exit {
-        let _ = tokio::io::stdin().read(&mut b).await.unwrap();
+        let _ = std::io::stdin().read(&mut b).unwrap();
     }
-    client.close().await.unwrap();
+ 
+   client.close().await.unwrap();
 }
 
 async fn clear_random_blank(client: &Client, board: &mut Board) -> Option<(usize, usize)> {
-    let mut blanks = Vec::new();
-    for r in 0..NROWS {
-        for c in 0..NCOLS {
-            if board[r][c] == BLANK {
-                blanks.push((r, c));
-            }
-        }
-    }
+    let blanks: Vec<_> = all_cells()
+        .filter(|&(r, c)| board[r][c] == BLANK)
+        .collect();
     if blanks.is_empty() {
         return None;
     }
@@ -153,24 +129,14 @@ async fn clear_random_blank(client: &Client, board: &mut Board) -> Option<(usize
 }
 
 async fn check_all_bombs_flagged_then_clear(client: &Client, board: &mut Board) -> Option<HashSet<(usize, usize)>> {
-    let mut nbombs = 0;
-    for r in 0..NROWS {
-        for c in 0..NCOLS {
-            if board[r][c] == BOMBFLAGGED {
-                nbombs += 1;
-            }
-        }
-    }
+    let nbombs = all_cells()
+        .filter(|&(r, c)| board[r][c] == BOMBFLAGGED)
+        .count();
 
     if nbombs == NBOMBS {
-        let mut blanks = Vec::new();
-        for r in 0..NROWS {
-            for c in 0..NCOLS {
-                if board[r][c] == BLANK {
-                    blanks.push((r, c));
-                }
-            }
-        }
+        let blanks: Vec<_> = all_cells()
+            .filter(|&(r, c)| board[r][c] == BLANK)
+            .collect();
         click(client, blanks.iter().cloned(), MOUSE_BUTTON_LEFT).await;
         println!("clearing all blanks (we've marked all the bombs)");
         Some(blanks.into_iter().collect())
@@ -191,14 +157,10 @@ async fn click_center_cell(client: &Client) {
 }
 
 async fn flag(client: &Client, board: &mut Board) -> bool {
-    let mut to_flag = HashSet::new();
-    for r in 0..NROWS {
-        for c in 0..NCOLS {
-            if board[r][c] > 0 && blank_and_flagged_surrounding(board, r, c).count() == board[r][c] as usize {
-                to_flag.extend(blank_surrounding(board, r, c));
-            }
-        }
-    }
+    let to_flag: HashSet<_> = all_cells()
+        .filter(|&(r, c)| board[r][c] > 0 && blank_and_flagged_surrounding(board, r, c).count() == board[r][c] as usize)
+        .flat_map(|(r, c)| blank_surrounding(board, r, c))
+        .collect();
 
     if to_flag.is_empty() {
         return false;
@@ -213,24 +175,21 @@ async fn flag(client: &Client, board: &mut Board) -> bool {
 
 async fn flag_harder(client: &Client, board: &mut Board) -> bool {
     let mut to_flag = HashSet::new();
-    for r in 0..NROWS {
-        for c in 0..NCOLS {
-            if board[r][c] <= 0 {
+    for (r, c) in all_cells() {
+        if board[r][c] <= 0 {
+            continue;
+        }
+        let self_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
+        let self_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
+        for (r, c) in numbered_surrounding(board, r, c) {
+            let neighbor_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
+            let neighbor_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
+            if self_remaining > neighbor_remaining {
                 continue;
             }
-            let self_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
-            let self_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
-            for (r, c) in numbered_surrounding(board, r, c) {
-                let neighbor_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
-                let neighbor_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
-                if self_remaining > neighbor_remaining {
-                    continue;
-                }
-                let diff: Vec<_> = neighbor_surrounding.difference(&self_surrounding).collect();
-                if diff.len() == neighbor_remaining - self_remaining {
-                    to_flag.extend(diff);
-                }
-
+            let diff: Vec<_> = neighbor_surrounding.difference(&self_surrounding).collect();
+            if diff.len() == neighbor_remaining - self_remaining {
+                to_flag.extend(diff);
             }
         }
     }
@@ -247,24 +206,10 @@ async fn flag_harder(client: &Client, board: &mut Board) -> bool {
 }
 
 async fn clear(client: &Client, board: &Board) -> HashSet<(usize, usize)> {
-    let mut to_clear = HashSet::new();
-    for r in 0..NROWS {
-        for c in 0..NCOLS {
-            if board[r][c] <= 0 {
-                continue;
-            }
-            let self_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
-            let self_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
-            for (r, c) in numbered_surrounding(board, r, c) {
-                let neighbor_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
-                let neighbor_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
-
-                if self_surrounding.is_subset(&neighbor_surrounding) && self_remaining == neighbor_remaining {
-                    to_clear.extend(neighbor_surrounding.difference(&self_surrounding))
-                }
-            }
-        }
-    }
+    let to_clear: HashSet<_> = all_cells()
+        .filter(|&(r, c)| board[r][c] > 0 && flagged_surrounding(board, r, c).count() == board[r][c] as usize)
+        .flat_map(|(r, c)| blank_surrounding(board, r, c))
+        .collect();
 
     if to_clear.is_empty() {
         return HashSet::new();
@@ -276,10 +221,18 @@ async fn clear(client: &Client, board: &Board) -> HashSet<(usize, usize)> {
 
 async fn clear_harder(client: &Client, board: &Board) -> HashSet<(usize, usize)> {
     let mut to_clear = HashSet::new();
-    for r in 0..NROWS {
-        for c in 0..NCOLS {
-            if board[r][c] > 0 && flagged_surrounding(board, r, c).count() == board[r][c] as usize {
-                to_clear.extend(blank_surrounding(board, r, c));
+    for (r, c) in all_cells() {
+        if board[r][c] <= 0 {
+            continue;
+        }
+        let self_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
+        let self_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
+        for (r, c) in numbered_surrounding(board, r, c) {
+            let neighbor_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
+            let neighbor_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
+
+            if self_surrounding.is_subset(&neighbor_surrounding) && self_remaining == neighbor_remaining {
+                to_clear.extend(neighbor_surrounding.difference(&self_surrounding))
             }
         }
     }
@@ -337,11 +290,8 @@ async fn update_full_board(client: &Client, board: &mut Board) {
             .expect("element has an id");
         let (r, c) = id.split_once('_').expect("id with underscore");
         let r = r.parse::<isize>().expect("valid int for row") - 1;
-        if r < 0 || r >= NROWS as isize {
-            continue;
-        }
         let c = c.parse::<isize>().expect("valid int for col") - 1;
-        if c < 0 || c >= NCOLS as isize {
+        if r < 0 || r >= NROWS as isize || c < 0 || c >= NCOLS as isize {
             continue;
         }
 
@@ -419,4 +369,12 @@ fn surrounding(r: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
         .map(move |(dr, dc)| (r as isize + dr, c as isize + dc))
         .filter(|&(r, c)| r >= 0 && r < NROWS as isize && c >= 0 && c < NCOLS as isize)
         .map(|(r, c)| (r as usize, c as usize))
+}
+
+fn all_cells() -> impl Iterator<Item = (usize, usize)> {
+    (0..NROWS)
+        .flat_map(|r| {
+            (0..NCOLS)
+                .map(move |c| (r, c))
+        })
 }
