@@ -7,13 +7,14 @@ use std::time::Instant;
 
 const NROWS: usize = 16;
 const NCOLS: usize = 30;
+const NBOMBS: usize = 99;
 const BLANK: i8 = -1;
 const BOMBFLAGGED: i8 = -2;
 
 type Board = [[i8; NCOLS]; NROWS];
 
 use tokio::io::AsyncReadExt;
-const STEP: bool = false;
+const STEP: bool = true;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -28,80 +29,208 @@ async fn main() {
         .await
         .expect("failed to go to minesweeper site");
 
-    let starting_cell = (NROWS / 2, NCOLS / 2);
-    let center_cell = client
-        .find(Locator::Id(&format!("{}_{}", starting_cell.0, starting_cell.1)))
-        .await
-        .expect("middle cell");
-    center_cell
-        .click()
-        .await
-        .expect("clickable item");
-
     let mut b = [0u8; 1];
     let mut board = Box::new([[BLANK; NCOLS]; NROWS]);
-    let mut updated_cells = HashSet::new();
+    let mut updated_cells = None;
 
-    loop {
+    click_center_cell(&client).await;
+
+    let automated_exit = loop {
+        if client.find(Locator::Css(".facewin")).await.is_ok() {
+            println!("Victory!");
+            break true;
+        }
+        if let Ok(facedead) = client.find(Locator::Css(".facedead")).await {
+            println!("Defeat!");
+            if STEP {
+                break true;
+            } else {
+                facedead
+                    .click()
+                    .await
+                    .expect("clickable facedead to reset game");
+                click_center_cell(&client).await;
+            }
+        }
+
         let start = Instant::now();
-        let stale_cells = std::mem::take(&mut updated_cells);
-        if stale_cells.is_empty() {
-            update_full_board(&client, &mut board).await;
-        } else {
+        if let Some(stale_cells) = updated_cells {
             update_board(&client, &mut board, stale_cells).await;
+        } else {
+            update_full_board(&client, &mut board).await;
         }
         println!("board fetched in {:?}", start.elapsed());
         
         let start = Instant::now();
-        let flag_succ = flag(&client, &mut board).await;
-        if flag_succ {
+        let flag_succ = if flag(&client, &mut board).await {
             println!("sucessfully flagged in {:?}", start.elapsed());
+            true
+        } else if flag_harder(&client, &mut board).await {
+            println!("sucessfully flagged HARDER in {:?}", start.elapsed());
+            true
         } else {
             println!("no flagging to be done");
-        }
+            false
+        };
 
         if STEP {
             let _ = tokio::io::stdin().read(&mut b).await.unwrap();
             if b[0] == b'q' {
-                break;
+                break false;
             }
         }
 
         let start = Instant::now();
-        updated_cells = clear(&client, &board).await;
-        if !updated_cells.is_empty() {
+        // check for non-empty result
+        if let Some(cells) = Some(clear(&client, &board).await).filter(|c| !c.is_empty()) {
             println!("sucessfully cleared in {:?}", start.elapsed());
+            updated_cells = Some(cells);
+        } else if let Some(cells) = Some(clear_harder(&client, &board).await).filter(|c| !c.is_empty()) {
+            println!("sucessfully cleared HARDER in {:?}", start.elapsed());
+            updated_cells = Some(cells);
         } else {
             println!("no clearing to be done");
+            if flag_succ {
+                updated_cells = Some(Default::default());
+            } else {
+                updated_cells = None;
+            }
         }
 
         if STEP {
             let _ = tokio::io::stdin().read(&mut b).await.unwrap();
             if b[0] == b'q' {
-                break;
+                break false;
             }
         }
 
-        if !flag_succ && updated_cells.is_empty() {
+        if !flag_succ && updated_cells.is_none() {
+            if flag_succ {
+                if let Some(cells) = check_all_bombs_flagged_then_clear(&client, &mut board).await {
+                    updated_cells = Some(cells);
+                    continue;
+                }
+            }
             println!("reached a fix point");
-            let _ = tokio::io::stdin().read(&mut b).await.unwrap();
-            if b[0] == b'q' {
-                break;
-            } else {
-                continue;
+            if STEP {
+                let _ = tokio::io::stdin().read(&mut b).await.unwrap();
+                if b[0] == b'q' {
+                    break false;
+                } else {
+                    continue;
+                }
+            } else if let Some(pos) = clear_random_blank(&client, &mut board).await {
+                updated_cells = Some(HashSet::from([pos]));
+            }
+        }
+    };
+
+    if automated_exit {
+        let _ = tokio::io::stdin().read(&mut b).await.unwrap();
+    }
+    client.close().await.unwrap();
+}
+
+async fn clear_random_blank(client: &Client, board: &mut Board) -> Option<(usize, usize)> {
+    let mut blanks = Vec::new();
+    for r in 0..NROWS {
+        for c in 0..NCOLS {
+            if board[r][c] == BLANK {
+                blanks.push((r, c));
+            }
+        }
+    }
+    if blanks.is_empty() {
+        return None;
+    }
+
+    println!("going RANDOM!!!");
+
+    let r: usize = rand::random();
+    let ix = r % blanks.len();
+    click(client, [blanks[ix]], MOUSE_BUTTON_LEFT).await;
+    Some(blanks[ix])
+}
+
+async fn check_all_bombs_flagged_then_clear(client: &Client, board: &mut Board) -> Option<HashSet<(usize, usize)>> {
+    let mut nbombs = 0;
+    for r in 0..NROWS {
+        for c in 0..NCOLS {
+            if board[r][c] == BOMBFLAGGED {
+                nbombs += 1;
             }
         }
     }
 
-    client.close().await.unwrap();
+    if nbombs == NBOMBS {
+        let mut blanks = Vec::new();
+        for r in 0..NROWS {
+            for c in 0..NCOLS {
+                if board[r][c] == BLANK {
+                    blanks.push((r, c));
+                }
+            }
+        }
+        click(client, blanks.iter().cloned(), MOUSE_BUTTON_LEFT).await;
+        println!("clearing all blanks (we've marked all the bombs)");
+        Some(blanks.into_iter().collect())
+    } else {
+        None
+    }
+}
+
+async fn click_center_cell(client: &Client) {
+    let starting_cell = (NROWS / 2, NCOLS / 2);
+    client
+        .find(Locator::Id(&format!("{}_{}", starting_cell.0, starting_cell.1)))
+        .await
+        .expect("middle cell")
+        .click()
+        .await
+        .expect("clickable item");
 }
 
 async fn flag(client: &Client, board: &mut Board) -> bool {
     let mut to_flag = HashSet::new();
     for r in 0..NROWS {
         for c in 0..NCOLS {
-            if board[r][c] > 0 && n_surrounding(board, r, c) == board[r][c] as usize {
-                to_flag.extend(unflagged_surrounding(board, r, c));
+            if board[r][c] > 0 && blank_and_flagged_surrounding(board, r, c).count() == board[r][c] as usize {
+                to_flag.extend(blank_surrounding(board, r, c));
+            }
+        }
+    }
+
+    if to_flag.is_empty() {
+        return false;
+    }
+
+    click(client, to_flag.iter().copied(), MOUSE_BUTTON_RIGHT).await;
+    for (r, c) in to_flag {
+        board[r][c] = BOMBFLAGGED;
+    }
+    true
+}
+
+async fn flag_harder(client: &Client, board: &mut Board) -> bool {
+    let mut to_flag = HashSet::new();
+    for r in 0..NROWS {
+        for c in 0..NCOLS {
+            if board[r][c] <= 0 {
+                continue;
+            }
+            let self_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
+            let self_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
+            for (r, c) in numbered_surrounding(board, r, c) {
+                let neighbor_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
+                let neighbor_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
+                if self_remaining > neighbor_remaining {
+                    continue;
+                }
+                let diff: Vec<_> = neighbor_surrounding.difference(&self_surrounding).collect();
+                if diff.len() == neighbor_remaining - self_remaining {
+                    to_flag.extend(diff);
+                }
+
             }
         }
     }
@@ -121,9 +250,36 @@ async fn clear(client: &Client, board: &Board) -> HashSet<(usize, usize)> {
     let mut to_clear = HashSet::new();
     for r in 0..NROWS {
         for c in 0..NCOLS {
-            if board[r][c] > 0 && n_flagged_surrounding(board, r, c) == board[r][c] as usize {
-                let unflagged = unflagged_surrounding(board, r, c);
-                to_clear.extend(unflagged);
+            if board[r][c] <= 0 {
+                continue;
+            }
+            let self_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
+            let self_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
+            for (r, c) in numbered_surrounding(board, r, c) {
+                let neighbor_surrounding: HashSet<_> = blank_surrounding(board, r, c).collect();
+                let neighbor_remaining = board[r][c] as usize - flagged_surrounding(board, r, c).count();
+
+                if self_surrounding.is_subset(&neighbor_surrounding) && self_remaining == neighbor_remaining {
+                    to_clear.extend(neighbor_surrounding.difference(&self_surrounding))
+                }
+            }
+        }
+    }
+
+    if to_clear.is_empty() {
+        return HashSet::new();
+    }
+
+    click(client, to_clear.iter().copied(), MOUSE_BUTTON_LEFT).await;
+    to_clear
+}
+
+async fn clear_harder(client: &Client, board: &Board) -> HashSet<(usize, usize)> {
+    let mut to_clear = HashSet::new();
+    for r in 0..NROWS {
+        for c in 0..NCOLS {
+            if board[r][c] > 0 && flagged_surrounding(board, r, c).count() == board[r][c] as usize {
+                to_clear.extend(blank_surrounding(board, r, c));
             }
         }
     }
@@ -210,66 +366,57 @@ async fn update_cell(board: &mut Board, el: Element, r: usize, c: usize, to_upda
         board[r][c] = n;
         if let Some(to_update) = to_update {
             if n == 0 {
-                for_surrounding(r, c, |r, c| {
+                for (r, c) in surrounding(r, c) {
                     to_update.insert((r, c));
-                });
+                }
             }
         }
     } else if class == "bombflagged" {
         board[r][c] = BOMBFLAGGED;
+    } else if class == "bombrevealed" {
+        println!("BOOM");
+        std::process::exit(1);
     } else {
         println!("unrecognized class: {class}");
     }
 }
 
-fn unflagged_surrounding(board: &Board, r: usize, c: usize) -> Vec<(usize, usize)> {
-    let mut unflagged = Vec::new();
-    for_surrounding(r, c, |r, c| {
-        if board[r][c] == BLANK {
-            unflagged.push((r, c));
-        }
-    });
-    unflagged
+fn blank_and_flagged_surrounding(board: &Board, r: usize, c: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    surrounding(r, c)
+        .filter(|&(r, c)| {
+            let e = board[r][c];
+            e == BLANK || e == BOMBFLAGGED
+        })
 }
 
-fn n_flagged_surrounding(board: &Board, r: usize, c: usize) -> usize {
-    let mut count = 0;
-    for_surrounding(r, c, |r, c| {
-        let e = board[r][c];
-        if e == BOMBFLAGGED {
-            count += 1;
-        }
-    });
-    count
+fn blank_surrounding(board: &Board, r: usize, c: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    surrounding(r, c)
+        .filter(|&(r, c)| board[r][c] == BLANK)
 }
 
-fn n_surrounding(board: &Board, r: usize, c: usize) -> usize {
-    let mut count = 0;
-    for_surrounding(r, c, |r, c| {
-        let e = board[r][c];
-        if e == BLANK || e == BOMBFLAGGED {
-            count += 1;
-        }
-    });
-    count
+fn flagged_surrounding(board: &Board, r: usize, c: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    surrounding(r, c)
+        .filter(|&(r, c)| board[r][c] == BOMBFLAGGED)
 }
 
-fn for_surrounding(r: usize, c: usize, mut f: impl FnMut(usize, usize)) {
-    for dr in [-1, 0, 1] {
-        let r = r as isize + dr;
-        if r < 0 || r >= NROWS as isize {
-            continue;
-        }
-        for dc in [-1, 0, 1] {
-            if dr == 0 && dc == 0 {
-                continue;
-            }
-            let c = c as isize + dc;
-            if c < 0 || c >= NCOLS as isize {
-                continue;
-            }
+fn numbered_surrounding(board: &Board, r: usize, c: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    surrounding(r, c)
+        .filter(|&(r, c)| board[r][c] > 0)
+}
 
-            f(r as usize, c as usize);
-        }
-    }
+fn surrounding(r: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
+    [
+        (-1, -1),
+        (-1, -0),
+        (-1,  1),
+        ( 0, -1),
+        ( 0,  1),
+        ( 1, -1),
+        ( 1,  0),
+        ( 1,  1),
+    ]
+        .iter()
+        .map(move |(dr, dc)| (r as isize + dr, c as isize + dc))
+        .filter(|&(r, c)| r >= 0 && r < NROWS as isize && c >= 0 && c < NCOLS as isize)
+        .map(|(r, c)| (r as usize, c as usize))
 }
